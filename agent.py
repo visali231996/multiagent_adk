@@ -1,0 +1,340 @@
+import operator
+import warnings
+import logging
+import os
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+
+# IMPORTANT: Replace this with the ABSOLUTE path to your my_adk_mcp_server.py script
+PATH_TO_YOUR_MCP_SERVER_SCRIPT =r"C:\Users\HP\Desktop\google_adk\my_agent\my_adk_mcp_server.py" # <<< REPLACE
+
+if "REPLACE" in PATH_TO_YOUR_MCP_SERVER_SCRIPT:
+    print("WARNING: PATH_TO_YOUR_MCP_SERVER_SCRIPT is not set correctly.")
+    # Optionally, raise an error if the path is critical
+
+
+# 1. Mute Pydantic/ADK UserWarnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# 2. Mute LiteLLM's internal logs
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+
+# 3. Mute LiteLLM's standard print statements
+os.environ["LITELLM_LOG"] = "ERROR"
+from typing import Annotated, Sequence, TypedDict
+from google.adk.agents.llm_agent import Agent
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq # Or use ChatOpenAI
+import os
+from dotenv import load_dotenv
+load_dotenv()
+import logging
+import json
+import docx
+import re
+from google.adk import Agent
+from google.adk.models.lite_llm import LiteLlm
+
+
+
+
+def load_recipes_from_word(file):
+    file.seek(0)
+    doc = docx.Document(file)
+    # Combine all paragraphs into one string to get the full JSON
+    full_text = "".join([para.text for para in doc.paragraphs])
+    
+    try:
+        # Parse the string as JSON
+        recipes = json.loads(full_text)
+        return recipes
+    except json.JSONDecodeError as e:
+        #st.error(f"Failed to parse JSON in Word doc: {e}")
+        logging.error("File uploaded is not in json format")
+        return []
+
+
+
+def extract_ingredients(user_input: str) -> list[str]:
+    """
+    Extracts a clean list of food ingredients from a raw user string.
+    
+    Args:
+        user_input: The text provided by the user (e.g., 'I have lentils, rice, and onions').
+    """
+    # Use the LLM's logic via instructions to call this, 
+    # but we can add basic regex cleaning here if needed.
+    # Most of the 'extraction' happens because the LLM identifies these words.
+    ingredients = [i.strip().lower() for i in re.split(r',|and|\.', user_input) if i.strip()]
+    return ingredients
+
+def extract_preferences(user_query: str) -> dict:
+    """
+    Extracts cooking time limits and dietary restrictions from the user's request.
+    
+    Args:
+        user_query: The raw query from the user.
+    """
+    # Extract numbers followed by 'min'
+    time_match = re.search(r'(\d+)\s*min', user_query.lower())
+    max_time = int(time_match.group(1)) if time_match else 60 # Default to 60 mins
+    
+    # Common dietary tags to look for
+    diet_tags = ["vegan", "vegetarian", "gluten-free", "keto", "dairy-free"]
+    found_diets = [d for d in diet_tags if d in user_query.lower()]
+    
+    return {
+        "max_cooking_time": max_time,
+        "dietary_restrictions": found_diets
+    }
+
+
+
+def search_recipes_names(ingredients: list[str], max_time: int = 60, diets: list[str] = None) -> str:
+    """
+    Searches the local Word document database for recipe names matching the criteria.
+    
+    Args:
+        ingredients: List of ingredients available.
+        max_time: Maximum cooking time in minutes.
+        diets: List of dietary restrictions (e.g., ['vegan']).
+    """
+    path = r"C:\Users\HP\Desktop\google_adk\my_agent\name.docx"
+    
+    try:
+        doc = docx.Document(path)
+        full_text = "\n".join([p.text for p in doc.paragraphs]).strip()
+        all_recipes = json.loads(full_text)
+    except Exception as e:
+        return f"Error accessing database: {str(e)}"
+
+    matches = []
+    user_ings = [i.lower() for i in ingredients]
+
+    for recipe in all_recipes:
+        # Filter 1: Time
+        if recipe.get("cooking_time", 999) > max_time:
+            continue
+            
+        # Filter 2: Diet
+        if diets:
+            recipe_diets = [d.lower() for d in recipe.get("dietary", [])]
+            if not all(d.lower() in recipe_diets for d in diets):
+                continue
+
+        # Filter 3: Ingredient Match & Scoring
+        recipe_ingredients = [i.lower() for i in recipe.get("ingredients", [])]
+        score = 0
+        for u_ing in user_ings:
+            if any(u_ing in r_ing for r_ing in recipe_ingredients):
+                score += 1
+        
+        if score > 0:
+            recipe["match_score"] = score
+            matches.append(recipe)
+
+    # Sort by score (best matches first)
+    ranked = sorted(matches, key=lambda x: x["match_score"], reverse=True)
+    
+    if not ranked:
+        return "No recipes found matching your ingredients and preferences."
+        
+    return json.dumps(ranked[:3], indent=2)
+
+def get_recipes(recipe_name: str) -> str:
+    """
+    Confirms the selection of a specific recipe name to be generated by the AI.
+    
+    Args:
+        recipe_name: The name of the dish the user chose from the search results.
+    """
+    # This tool confirms the choice. The LLM sees this output and 
+    # then proceeds to use its internal knowledge to write the full recipe.
+    return f"Excellent choice! I am now generating the full professional recipe for: {recipe_name}."
+
+def search_by_cuisine(cuisine: str, max_time: int = 60) -> str:
+    """
+    Searches the name.docx file specifically for recipes matching a cuisine type.
+    
+    Args:
+        cuisine: The type of food (e.g., 'Italian', 'Indian', 'Mexican').
+        max_time: Maximum cooking time allowed.
+    """
+    path = r"C:\Users\HP\Desktop\google_adk\my_agent\name.docx"
+    try:
+        doc = docx.Document(path)
+        full_text = "\n".join([p.text for p in doc.paragraphs]).strip()
+        all_recipes = json.loads(full_text)
+        
+        # Filter by cuisine (case-insensitive)
+        matches = [
+            {"name": r['name'], "time": r.get('cooking_time')} 
+            for r in all_recipes 
+            if r.get("cuisine", "").lower() == cuisine.lower() 
+            and r.get("cooking_time", 999) <= max_time
+        ]
+        
+        return json.dumps(matches) if matches else f"No {cuisine} recipes found."
+    except Exception as e:
+        return f"Error: {str(e)}"
+    
+
+import requests
+
+def get_live_market_prices(ingredient_name: str) -> str:
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "ERROR: TAVILY_API_KEY missing."
+
+    print(f"--- DEBUG: Searching for {ingredient_name} ---")
+    
+    query = f"current price of {ingredient_name} at Walmart Target Kroger 2026"
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": "basic", # Basic is often faster and better for snippets
+        "max_results": 5
+    }
+    
+    try:
+        response = requests.post("https://api.tavily.com/search", json=payload, timeout=10)
+        result = response.json()
+        
+        # If the 'answer' field is empty, we combine the website snippets
+        if result.get("answer"):
+            return result["answer"]
+        
+        # Extract snippets from the 'results' list
+        snippets = []
+        for res in result.get("results", []):
+            snippets.append(f"Source: {res['url']}\nContent: {res['content']}\n")
+        
+        combined_results = "\n".join(snippets)
+        print(f"--- DEBUG: Found {len(snippets)} snippets ---")
+        
+        return combined_results if snippets else "No price data found in web search."
+    except Exception as e:
+        return f"Tool Error: {str(e)}"
+    
+def format_shopping_list(items_json: str) -> str:
+    """
+    Optional helper to organize multiple ingredients into one search query.
+    """
+    items = json.loads(items_json)
+    summary = "Shopping List Search:\n"
+    for item in items:
+        summary += f"- {item}\n"
+    return summary
+    
+import json
+
+def manage_wallet(action: str, amount: float = 0.0) -> str:
+    """
+    Manages the user's wallet balance.
+    Actions: 'check', 'deduct', 'deposit'
+    """
+    wallet_file = "wallet.json"
+    
+    # Initialize wallet if it doesn't exist
+    if not os.path.exists(wallet_file):
+        with open(wallet_file, 'w') as f:
+            json.dump({"balance": 100.00}, f)
+
+    with open(wallet_file, 'r') as f:
+        data = json.load(f)
+
+    if action == "check":
+        return f"Current Balance: ${data['balance']:.2f}"
+    
+    elif action == "deduct":
+        if data['balance'] >= amount:
+            data['balance'] -= amount
+            with open(wallet_file, 'w') as f:
+                json.dump(data, f)
+            return f"Success! Deducted ${amount:.2f}. New Balance: ${data['balance']:.2f}"
+        else:
+            return f"Transaction Denied: Insufficient funds. Balance is only ${data['balance']:.2f}"
+
+    return "Invalid action."
+
+wallet_agent = Agent(
+    model=LiteLlm(model="openai/gpt-4o"),
+    name='wallet_agent',
+    description='Manages payments and virtual wallet balance.',
+    instruction="""You are a Financial Controller.
+    1. Always 'check' the balance before authorizing a purchase.
+    2. If the user wants to buy something, verify if the balance is enough.
+    3. Ask for a simple 'YES' to authenticate the purchase.
+    4. Once confirmed, use 'deduct' to update the wallet and show the final balance.""",
+    tools=[manage_wallet],
+)
+
+shopper_agent = Agent(
+    model=LiteLlm(model="openai/gpt-4o"),
+    name='shopper_agent',
+    description='A live price-tracking specialist.',
+    instruction="""You are a Live Market Analyst. 
+    
+    1. Call 'get_live_market_prices' for the ingredient.
+    2. You will receive website snippets. Read through them carefully to find prices (e.g., '$2.50', '2 for $5').
+    3. CREATE a Markdown Table with: | Ingredient | Store | Price | Source Link |.
+    4. If the data is messy, do your best to summarize the most recent price found.
+    5. Be sure to check the 'Source' URL provided in the snippets to identify the Store.""",
+    tools=[get_live_market_prices],
+)
+    
+cuisine_agent = Agent(
+    model=LiteLlm(model="openai/gpt-4o"),
+    name='cuisine_agent',
+    description='Specialist in filtering recipes by cuisine type (Indian, Italian, etc).',
+    instruction="""You are a Cuisine Expert. 
+    1. Identify the cuisine the user is asking for.
+    2. Use the 'search_by_cuisine' tool to find matching names from the database.
+    3. Return only the list of names found.""",
+    tools=[search_by_cuisine],
+)
+
+
+recipe_agent = Agent(
+    model=LiteLlm(model="openai/gpt-4o"),
+    name='recipe_agent',
+    description='A recipe assistant for user questions.',
+    instruction="""take the ingredients from user query,
+    ask if he has any dietary preferences/restrictions,
+    call necessary tools and give response,
+    make sure to answer only questions related to cooking""",
+    tools=[extract_ingredients,extract_preferences,search_recipes_names,get_recipes],
+)
+
+
+
+root_agent = Agent(
+    model=LiteLlm(model="openai/gpt-4o"),
+    name='chef_manager',
+    description='The Kitchen & Finance Manager.',
+    instruction="""You lead a team of 4 specialized agents.
+    
+    WORKFLOW:
+    1. Use 'cuisine_agent' or 'recipe_agent' to find a dish.
+    2. Use 'shopper_agent' to get live market prices for that dish.
+    3. Calculate the total cost of the ingredients.
+    4. Delegate to 'wallet_agent' to check if the user has enough money.
+    5. If funds are sufficient, ask the user: 'The total is $X.XX. Should I proceed with the purchase?'
+    6. If they say yes, tell 'wallet_agent' to deduct the amount.""",
+    tools=[
+        McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params = StdioServerParameters(
+                    command='python', # Command to run your MCP server script
+                    args=[PATH_TO_YOUR_MCP_SERVER_SCRIPT], # Argument is the path to the script
+                )
+            )
+            # tool_filter=['load_web_page'] # Optional: ensure only specific tools are loaded
+        )
+    ],
+    sub_agents=[cuisine_agent, recipe_agent, shopper_agent, wallet_agent],
+)
+
+
