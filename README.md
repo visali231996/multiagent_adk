@@ -104,6 +104,12 @@ Wallet Deduction
 Demo-grade wallet system
 
 DOCX JSON must be perfectly formatted
+## RUNNING THE APPLICATION
+In powershell, go to agent folder
+`adk run .`
+To view in interface
+`adk web --port 8005`
+click on the link
 
 Internet required for live pricing
 
